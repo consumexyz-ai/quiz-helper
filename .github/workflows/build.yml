@@ -11,12 +11,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install mss pillow rapidfuzz winocr pyinstaller
-      - run: python -m PyInstaller --onefile --noconsole --name ROXQuizHelper --collect-all winocr --collect-submodules winrt app.py
-      - run: copy qa.json dist\qa.json
+      - run: python -m pip install mss pillow rapidfuzz pyinstaller
+      - run: python -m PyInstaller --onefile --noconsole --name ROXQuizHelper app.py
+      - name: Bundle Tesseract + Thai data
+        shell: pwsh
+        run: |
+          choco install tesseract -y --no-progress
+          Copy-Item "C:\Program Files\Tesseract-OCR" dist\tesseract -Recurse
+          Invoke-WebRequest https://github.com/tesseract-ocr/tessdata_fast/raw/main/tha.traineddata -OutFile dist\tesseract\tessdata\tha.traineddata
+          Copy-Item qa.json dist\qa.json
+          & dist\tesseract\tesseract.exe --list-langs
       - uses: actions/upload-artifact@v4
         with:
           name: ROXQuizHelper
-          path: |
-            dist/ROXQuizHelper.exe
-            dist/qa.json
+          path: dist
