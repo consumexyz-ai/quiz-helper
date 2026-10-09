@@ -1,0 +1,22 @@
+name: Build exe
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install mss pillow rapidfuzz winocr pyinstaller
+      - run: python -m PyInstaller --onefile --noconsole --name ROXQuizHelper --collect-all winocr --collect-submodules winrt app.py
+      - run: copy qa.json dist\qa.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ROXQuizHelper
+          path: |
+            dist/ROXQuizHelper.exe
+            dist/qa.json
