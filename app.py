@@ -7,7 +7,7 @@ except Exception:
     pass
 
 import mss
-from PIL import Image
+from PIL import Image, ImageOps
 from rapidfuzz import process, fuzz
 
 BASE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
@@ -19,36 +19,30 @@ def norm(s):
     return re.sub(r"[\s\W_]+", "", s).lower()
 
 
-_LANG = [None]
-
-
-def available_langs():
-    try:
-        from winrt.windows.media.ocr import OcrEngine
-        return [l.language_tag for l in OcrEngine.available_recognizer_languages]
-    except Exception as e:
-        return [f"ไม่สามารถอ่านรายการภาษา: {e!r}"]
+import subprocess, io
+TESS_DIR = os.path.join(BASE, "tesseract")
+TESS_EXE = os.path.join(TESS_DIR, "tesseract.exe")
 
 
 def ocr_lines(img):
-    import winocr
-    order = [_LANG[0]] if _LANG[0] else []
-    order += [l for l in ("th-TH", "th", "en-US") if l not in order]
-    last = None
-    for l in order:
-        try:
-            res = winocr.recognize_pil_sync(img, l)
-            _LANG[0] = l
-            return [x["text"] for x in res.get("lines", [])]
-        except Exception as e:
-            last = e
-    raise RuntimeError(f"{type(last).__name__}: {last} | ภาษาที่ Windows มี: {available_langs()}")
+    if not os.path.exists(TESS_EXE):
+        raise RuntimeError(f"ไม่พบ {TESS_EXE} (โฟลเดอร์ tesseract ต้องอยู่ข้างไฟล์ exe)")
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    env = dict(os.environ, TESSDATA_PREFIX=os.path.join(TESS_DIR, "tessdata"))
+    p = subprocess.run([TESS_EXE, "stdin", "stdout", "-l", "tha+eng", "--psm", "6"],
+                       input=buf.getvalue(), capture_output=True, env=env,
+                       creationflags=0x08000000)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.decode("utf-8", "ignore")[:300])
+    return [l.strip() for l in p.stdout.decode("utf-8", "ignore").splitlines() if l.strip()]
 
 
 def grab(sct, region):
     s = sct.grab(region)
     img = Image.frombytes("RGB", s.size, s.bgra, "raw", "BGRX")
-    return img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+    img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+    return ImageOps.autocontrast(img.convert("L"))
 
 
 def pick_region(root, title):
@@ -137,12 +131,12 @@ class App:
                         continue
                     last = qtxt
                     ms = process.extract(qtxt, self.nq, scorer=fuzz.ratio, limit=2)
-                    if not ms or ms[0][1] < 70:
+                    if not ms or ms[0][1] < 60:
                         self.show("ไม่พบโจทย์นี้ในฐานข้อมูล", f"OCR: {qtxt[:60]}")
                         continue
                     # ถ้าสองข้อคะแนนใกล้กันมาก (เช่น MVP คนละแผนที่) แสดงทั้งสอง
                     picks = [ms[0]]
-                    if len(ms) > 1 and ms[0][1] - ms[1][1] < 4 and ms[1][1] >= 70:
+                    if len(ms) > 1 and ms[0][1] - ms[1][1] < 4 and ms[1][1] >= 60:
                         picks.append(ms[1])
                     opts = ocr_lines(grab(sct, self.cfg["o"]))
                     out = []
