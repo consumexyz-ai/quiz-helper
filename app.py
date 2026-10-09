@@ -19,10 +19,30 @@ def norm(s):
     return re.sub(r"[\s\W_]+", "", s).lower()
 
 
-def ocr_lines(img, lang="th"):
+_LANG = [None]
+
+
+def available_langs():
+    try:
+        from winrt.windows.media.ocr import OcrEngine
+        return [l.language_tag for l in OcrEngine.available_recognizer_languages]
+    except Exception as e:
+        return [f"ไม่สามารถอ่านรายการภาษา: {e!r}"]
+
+
+def ocr_lines(img):
     import winocr
-    res = winocr.recognize_pil_sync(img, lang)
-    return [l["text"] for l in res.get("lines", [])]
+    order = [_LANG[0]] if _LANG[0] else []
+    order += [l for l in ("th-TH", "th", "en-US") if l not in order]
+    last = None
+    for l in order:
+        try:
+            res = winocr.recognize_pil_sync(img, l)
+            _LANG[0] = l
+            return [x["text"] for x in res.get("lines", [])]
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"{type(last).__name__}: {last} | ภาษาที่ Windows มี: {available_langs()}")
 
 
 def grab(sct, region):
@@ -140,7 +160,7 @@ class App:
                     note = " / ".join(f"{self.keys[m[2]]} ({int(m[1])}%)" for m in picks)
                     self.show("\n".join(out) if len(out) == 1 else "ไม่แน่ใจ:\n" + "\n".join(out), note)
                 except Exception as e:
-                    self.show("OCR error", str(e)[:150])
+                    self.show("OCR error", str(e)[:400])
 
     def show(self, a, i):
         self.root.after(0, lambda: (self.ans.config(text=a), self.info.config(text=i)))
