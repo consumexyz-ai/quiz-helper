@@ -3,6 +3,7 @@ import tkinter as tk
 from fractions import Fraction
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)  # ให้พิกัดตรงกับจอจริง
@@ -10,7 +11,8 @@ except Exception:
     pass
 
 import mss
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageChops
+from math import gcd
 from rapidfuzz import process, fuzz
 
 BASE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
@@ -40,6 +42,8 @@ def _fmt(d):
 
 
 def _unsure_operator(t):
+    if not re.search(r"[=＝?？]", t) or re.search(r"\d\s*/\s*\d", t):
+        return None
     nums = re.findall(r"\d+(?:\.\d+)?", t)
     rest = re.sub(r"[\s=＝?？.,:;!]", "", t)
     if len(nums) != 2 or len("".join(nums)) < 0.6 * len(rest):
@@ -51,25 +55,36 @@ def _unsure_operator(t):
     return f"{nums[0]} ? {nums[1]}", ans, None
 
 
-def solve_math(text):
+def solve_math(text, lenient=False):
     """โจทย์เลขล้วน เช่น '15 + 27 =?' หรือ '3/4 + 1/6 =?'
     คืน (นิพจน์สำหรับแสดง, คำตอบ, นิพจน์มาตรฐาน) หรือ None ถ้าไม่ใช่โจทย์เลขล้วน"""
     t = text.translate(_THDIG)
     if _THAI.search(t):
-        return None
+        if not lenient:
+            return None
+        t = _THAI.sub("§", t)             # ตัวไทยแทนด้วยตัวกั้น ไม่ให้นิพจน์ต่อข้ามคำไทย
     t = re.sub(r"[×✕✖xX]", "*", t)
     t = re.sub(r"[−–—‒]", "-", t)
     t = t.translate(_FIX)
     t = re.sub(r"(?<=\d),(?=\d)", ".", t)
-    found = _EXPR.findall(t)
+    ms_ = list(_EXPR.finditer(t))
+    if lenient:                           # ต้องมี = หรือ ? ตามหลังนิพจน์ทันที
+        ms_ = [m for m in ms_ if re.match(r"\s*[=＝?？]", t[m.end():])]
+    found = [m.group(0) for m in ms_]
     if not found:
-        return _unsure_operator(t)
+        return None if lenient else _unsure_operator(t)
     best = max(found, key=len)
     rest = re.sub(r"[\s=＝?？.,:;!]", "", t)
-    if len(re.sub(r"\s", "", best)) < 0.6 * len(rest):
+    if not lenient and len(re.sub(r"\s", "", best)) < 0.6 * len(rest):
         return None                      # มีข้อความอื่นปนเยอะ ไม่ใช่โจทย์เลขล้วน
     toks = [re.sub(r"\s+", "", x) for x in _TOK.findall(best)]
     toks = ["÷" if x in ("/", ":") else x for x in toks]
+    if len(toks) == 1:                    # มีตัวเลข/เศษส่วนก้อนเดียว ไม่มีเครื่องหมาย
+        if "/" in toks[0] and re.search(r"[=＝?？]", t):
+            a, b = toks[0].split("/")     # เช่น "72 / 8 =?" ที่ OCR อ่าน ÷ เป็น /
+            toks = [a, "÷", b]
+        else:
+            return None                   # เช่นหัวข้อ "ข้อที่ 2/2" ไม่ใช่โจทย์เลข
     has_frac = any("/" in x for x in toks)
 
     def val(x):
@@ -101,6 +116,97 @@ def solve_math(text):
         ans = _fmt(Decimal(r.numerator) / Decimal(r.denominator))
     pretty = " ".join(toks).replace("*", "×")
     return pretty, ans, "".join(toks)
+
+
+def find_math(lines, definite_only=False):
+    """ตรวจทีละบรรทัด (หัวข้อ 'ข้อที่ 2/2' และป้ายหมวดอยู่คนละบรรทัด จะไม่มารบกวน)"""
+    unsure = None
+    for ln in lines:
+        r = solve_math(ln)
+        if r and r[2]:
+            return r
+        if r and unsure is None:
+            unsure = r
+    return None if definite_only else unsure
+
+
+def solve_words(lines):
+    """ห.ร.ม. / ค.ร.น. ของสองจำนวน"""
+    for i, ln in enumerate(lines):
+        n = norm(ln)
+        kind = None
+        if "หรม" in n or fuzz.partial_ratio("ตัวหารร่วมมาก", n) >= 80:
+            kind = "ห.ร.ม."
+        elif "ครน" in n or fuzz.partial_ratio("ตัวคูณร่วมน้อย", n) >= 80:
+            kind = "ค.ร.น."
+        if not kind:
+            continue
+        txt = ln
+        if len(re.findall(r"\d+", txt)) < 2 and i + 1 < len(lines):
+            txt += " " + lines[i + 1]
+        nums = [int(x) for x in re.findall(r"\d+", txt)]
+        if len(nums) >= 2 and nums[0] and nums[1]:
+            a, b = nums[0], nums[1]
+            g = gcd(a, b)
+            return f"{kind} ของ {a} และ {b}", str(g if kind == "ห.ร.ม." else a * b // g)
+    return None
+
+
+def best_db(lines, nq):
+    """ลองจับคู่ทุกช่วง 1-3 บรรทัดติดกัน เลือกช่วงที่ตรงที่สุด (ตัดหัวข้อ/ป้ายหมวดที่ปนมาออกเอง)"""
+    L = [norm(x) for x in lines]
+    best = None
+    for i in range(len(L)):
+        for j in range(i, min(i + 3, len(L))):
+            c = "".join(L[i:j + 1])
+            if len(c) < 6:
+                continue
+            ms = process.extract(c, nq, scorer=fuzz.ratio, limit=2)
+            if ms and (best is None or ms[0][1] > best[0][1]):
+                best = ms
+    return best
+
+
+def decide(lines_fast, get_full, cancel_full, qa, keys, nq, mathdb):
+    """คืน (สำเร็จไหม, ข้อความคำตอบ, หมายเหตุ, บรรทัดทั้งหมดที่อ่านได้)"""
+    m = find_math(lines_fast, definite_only=True)
+    if m:
+        cancel_full()                                  # เป็นโจทย์เลขแล้ว ไม่ต้องรออ่านไทย
+        lines = lines_fast
+    else:
+        lines = get_full()
+        m = find_math(lines) or find_math(lines_fast)
+
+    if m:                                              # 1) โจทย์เลขล้วน -> คำนวณเอง
+        pretty, ans, canon = m
+        db = mathdb.get(canon) if canon else None
+        if db and db != ans:
+            return True, f"ไม่แน่ใจ: {ans} หรือ {db}", f"อ่านโจทย์ได้: {pretty} = ?  (คำนวณกับฐานข้อมูลไม่ตรงกัน)", lines
+        return True, ans, f"อ่านโจทย์ได้: {pretty} = ?" + ("  ✔ ตรงฐานข้อมูล" if db else ""), lines
+
+    w = solve_words(lines)                             # 2) ห.ร.ม. / ค.ร.น.
+    if w:
+        return True, w[1], f"อ่านโจทย์ได้: {w[0]} (คำนวณเอง)", lines
+
+    ms = best_db(lines, nq)                            # 3) โจทย์ข้อความ -> ฐานข้อมูล
+    if ms and ms[0][1] >= 60:
+        picks = [ms[0]]
+        if len(ms) > 1 and ms[0][1] - ms[1][1] < 4 and ms[1][1] >= 60:
+            picks.append(ms[1])
+        answers = [qa[keys[x[2]]] for x in picks]
+        note = " / ".join(f"{keys[x[2]]} ({int(x[1])}%)" for x in picks)
+        return True, (answers[0] if len(answers) == 1 else "ไม่แน่ใจ:\n" + "\n".join(answers)), note, lines
+
+    # 4) หาโจทย์ไม่เจอ -> ลองอ่านเป็นโจทย์เลขแบบผ่อนปรน (ตัดตัวไทยทิ้ง แล้วคิดเลขที่มี = หรือ ? ตามหลัง)
+    for src in (lines, lines_fast):
+        for cand in list(src) + [" ".join(src)]:
+            r = solve_math(cand, lenient=True)
+            if r and r[2]:
+                return True, r[1], f"ไม่พบในฐานข้อมูล → คำนวณเอง: {r[0]} = ?", lines
+
+    if not ms:
+        return False, "อ่านโจทย์ไม่ได้", "กำลังลองอ่านซ้ำ... (ถ้าไม่หาย ลองกด 'ตั้งพื้นที่' ใหม่)", lines
+    return False, "ไม่พบโจทย์นี้ในฐานข้อมูล", "OCR: " + " / ".join(lines)[:70], lines
 
 
 # ------------------------------------------------------------------ OCR
@@ -143,12 +249,21 @@ def prep(img):
     return ImageOps.autocontrast(img.convert("L"))
 
 
-def sig(img, size=(48, 24)):
-    return img.convert("L").resize(size).tobytes()
+CHANGE = 15                       # พิกเซลที่เปลี่ยนชัดเจนอย่างน้อยเท่านี้ ถือว่าภาพเปลี่ยน
+_LUT = [0] * 41 + [255] * 215
+
+
+def sig(img, maxw=320):
+    g = img.convert("L")
+    if g.width > maxw:
+        g = g.resize((maxw, max(1, g.height * maxw // g.width)))
+    return g
 
 
 def sdiff(a, b):
-    return sum(abs(p - q) for p, q in zip(a, b)) / len(a)
+    if a.size != b.size:
+        return 10 ** 9
+    return ImageChops.difference(a, b).point(_LUT).histogram()[255]
 
 
 def pick_region(root, title):
@@ -230,9 +345,23 @@ class App:
             json.dump(self.cfg, open(CFG_FILE, "w"))
             self.ans.config(text="รอโจทย์...")
 
+    def log(self, lines, why):
+        try:
+            p = os.path.join(BASE, "debug_log.txt")
+            if os.path.exists(p) and os.path.getsize(p) > 200_000:
+                return
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} [{why}] {lines}\n")
+        except Exception:
+            pass
+
     def loop(self):
         prev = done = None
-        stable = 0
+        stable = retries = 0
+        cleared = False
+        changed_since = retry_at = None
+        thr = CHANGE                       # ความไวในการตรวจว่าภาพเปลี่ยน (ปรับเองถ้าในกรอบมีเอฟเฟกต์ขยับตลอด)
+        recent = deque(maxlen=12)
         ex = ThreadPoolExecutor(2)
         with mss.mss() as sct:
             while self.running:
@@ -240,52 +369,50 @@ class App:
                 if not self.cfg.get("q"):
                     continue
                 try:
+                    now = time.time()
                     sg = sig(grab_raw(sct, self.cfg["q"]))
-                    stable = stable + 1 if prev is not None and sdiff(sg, prev) < 4 else 0
+                    d = sdiff(sg, prev) if prev is not None else 0
+                    recent.append(d)
+                    if len(recent) == recent.maxlen and max(recent) < CHANGE:
+                        thr = CHANGE                  # กรอบนิ่งแล้ว กลับไปใช้ความไวปกติ
+                    stable = stable + 1 if prev is not None and d < thr else 0
                     prev = sg
-                    if stable < 2:                      # รอภาพนิ่งประมาณ 0.2 วินาที
-                        continue
-                    if done is not None and sdiff(sg, done) < 4:
-                        continue                        # ภาพเดิมที่อ่านไปแล้ว
-                    done = sg
+                    differs = done is None or sdiff(sg, done) >= thr
+                    if differs:
+                        if changed_since is None:
+                            changed_since = now
+                        if not cleared:
+                            self.show("กำลังอ่านโจทย์...", "")     # ลบคำตอบข้อเก่าทันที กันเข้าใจผิด
+                            cleared = True
+                    else:
+                        changed_since = None
+                    force = differs and changed_since is not None and now - changed_since > 0.8
+                    if differs:
+                        if stable < 2 and not force:      # รอภาพนิ่ง (หรือบังคับอ่านถ้าภาพขยับไม่หยุด)
+                            continue
+                        if force and stable < 2:          # ภาพขยับไม่หยุด: ลดความไวตามระดับรบกวนที่วัดได้
+                            thr = max(CHANGE, int(sorted(recent)[len(recent) // 2] * 3) + 5)
+                        retries = 0
+                    else:                                  # ภาพเดิม: อ่านซ้ำเฉพาะเมื่อครั้งก่อนไม่สำเร็จ
+                        if retry_at is None or now < retry_at or retries >= 6:
+                            continue
+                        retries += 1
+                    done, cleared, changed_since, retry_at = sg, False, None, None
+
                     img = prep(grab_raw(sct, self.cfg["q"]))
                     hold = {}
-                    f_fast = ex.submit(ocr_lines, img, "eng")            # เร็ว: เหมาะกับโจทย์เลข
-                    f_full = ex.submit(ocr_lines, img, "tha+eng", hold)   # เต็ม: โจทย์ข้อความภาษาไทย
-                    raw_fast = " ".join(f_fast.result())
-                    if solve_math(raw_fast):
-                        cancel(hold)                                      # เป็นโจทย์เลขแล้ว ไม่ต้องรออ่านไทย
-                        raw = raw_fast
-                    else:
-                        raw = " ".join(f_full.result())
-
-                    # 1) โจทย์เลขล้วน -> คำนวณเอง
-                    m = solve_math(raw)
-                    if m:
-                        pretty, ans, canon = m
-                        db = self.mathdb.get(canon)
-                        if db and db != ans:
-                            self.show(f"ไม่แน่ใจ: {ans} หรือ {db}", f"อ่านโจทย์ได้: {pretty} = ?  (คำนวณกับฐานข้อมูลไม่ตรงกัน)")
-                        else:
-                            self.show(ans, f"อ่านโจทย์ได้: {pretty} = ?" + ("  ✔ ตรงฐานข้อมูล" if db else ""))
-                        continue
-
-                    # 2) โจทย์ข้อความ -> หาในฐานข้อมูล
-                    qtxt = norm(raw)
-                    if len(qtxt) < 6:
-                        continue
-                    ms = process.extract(qtxt, self.nq, scorer=fuzz.ratio, limit=2)
-                    if not ms or ms[0][1] < 60:
-                        self.show("ไม่พบโจทย์นี้ในฐานข้อมูล", f"OCR: {qtxt[:60]}")
-                        continue
-                    picks = [ms[0]]
-                    if len(ms) > 1 and ms[0][1] - ms[1][1] < 4 and ms[1][1] >= 60:
-                        picks.append(ms[1])
-                    answers = [self.qa[self.keys[x[2]]] for x in picks]
-                    note = " / ".join(f"{self.keys[x[2]]} ({int(x[1])}%)" for x in picks)
-                    self.show(answers[0] if len(answers) == 1 else "ไม่แน่ใจ:\n" + "\n".join(answers), note)
+                    f_fast = ex.submit(ocr_lines, img, "eng")              # เร็ว: เหมาะกับโจทย์เลข
+                    f_full = ex.submit(ocr_lines, img, "tha+eng", hold)     # เต็ม: โจทย์ภาษาไทย
+                    ok, text, note, lines = decide(f_fast.result(), f_full.result,
+                                                   lambda: cancel(hold),
+                                                   self.qa, self.keys, self.nq, self.mathdb)
+                    self.show(text, note)
+                    if not ok:
+                        retry_at = time.time() + 1.0
+                        self.log(lines, text)
                 except Exception as e:
                     self.show("OCR error", str(e)[:400])
+                    retry_at = time.time() + 1.0
 
     def show(self, a, i):
         self.root.after(0, lambda: (self.ans.config(text=a), self.info.config(text=i)))
