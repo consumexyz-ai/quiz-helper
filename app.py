@@ -2,6 +2,7 @@ import sys, os, json, re, time, threading, ctypes, subprocess, io
 import tkinter as tk
 from fractions import Fraction
 from decimal import Decimal
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)  # ให้พิกัดตรงกับจอจริง
@@ -29,9 +30,9 @@ _THAI = re.compile(r"[\u0e00-\u0e7f]")
 _THDIG = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 _FIX = str.maketrans({"O": "0", "o": "0", "l": "1", "I": "1", "|": "1", "S": "5", "B": "8"})
 _NUM = r"\d+(?:\.\d+)?"
-_ATOM = rf"{_NUM}(?:\s*/\s*\d+)?"            # ตัวเลข หรือเศษส่วน a/b
-_EXPR = re.compile(rf"{_ATOM}(?:\s*[-+*÷]\s*{_ATOM})+")
-_TOK = re.compile(rf"{_ATOM}|[-+*÷]")
+_ATOM = rf"(?:\d+\s*/\s*\d+(?![\d.])|{_NUM})"   # เศษส่วนจำนวนเต็ม a/b หรือตัวเลข/ทศนิยม
+_EXPR = re.compile(rf"{_ATOM}(?:\s*[-+*÷/:]\s*{_ATOM})+")
+_TOK = re.compile(rf"{_ATOM}|[-+*÷/:]")
 
 
 def _fmt(d):
@@ -44,7 +45,9 @@ def _unsure_operator(t):
     if len(nums) != 2 or len("".join(nums)) < 0.6 * len(rest):
         return None
     a, b = Decimal(nums[0]), Decimal(nums[1])
-    ans = f"ไม่แน่ใจเครื่องหมาย\n+ → {_fmt(a + b)}\n− → {_fmt(a - b)}"
+    ans = f"ไม่แน่ใจเครื่องหมาย\n+ → {_fmt(a + b)}\n− → {_fmt(a - b)}\n× → {_fmt(a * b)}"
+    if b != 0:
+        ans += f"\n÷ → {_fmt(a / b)}"
     return f"{nums[0]} ? {nums[1]}", ans, None
 
 
@@ -66,6 +69,7 @@ def solve_math(text):
     if len(re.sub(r"\s", "", best)) < 0.6 * len(rest):
         return None                      # มีข้อความอื่นปนเยอะ ไม่ใช่โจทย์เลขล้วน
     toks = [re.sub(r"\s+", "", x) for x in _TOK.findall(best)]
+    toks = ["÷" if x in ("/", ":") else x for x in toks]
     has_frac = any("/" in x for x in toks)
 
     def val(x):
@@ -100,17 +104,32 @@ def solve_math(text):
 
 
 # ------------------------------------------------------------------ OCR
-def ocr_lines(img):
+def ocr_lines(img, lang="tha+eng", holder=None):
     if not os.path.exists(TESS_EXE):
         raise RuntimeError(f"ไม่พบ {TESS_EXE} (โฟลเดอร์ tesseract ต้องอยู่ข้างไฟล์ exe)")
     buf = io.BytesIO()
     img.save(buf, "PNG")
     env = dict(os.environ, TESSDATA_PREFIX=os.path.join(TESS_DIR, "tessdata"), OMP_THREAD_LIMIT="1")
-    p = subprocess.run([TESS_EXE, "stdin", "stdout", "-l", "tha+eng", "--psm", "6"],
-                       input=buf.getvalue(), capture_output=True, env=env, creationflags=0x08000000)
+    p = subprocess.Popen([TESS_EXE, "stdin", "stdout", "-l", lang, "--oem", "1", "--psm", "6",
+                          "-c", "tessedit_do_invert=0"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         env=env, creationflags=0x08004000)   # ไม่เปิดหน้าต่าง + ลำดับความสำคัญต่ำ (ไม่ทำเกมกระตุก)
+    if holder is not None:
+        holder["p"] = p
+    out, err = p.communicate(buf.getvalue())
+    if holder is not None and holder.get("cancel"):
+        return []
     if p.returncode != 0:
-        raise RuntimeError(p.stderr.decode("utf-8", "ignore")[:300])
-    return [l.strip() for l in p.stdout.decode("utf-8", "ignore").splitlines() if l.strip()]
+        raise RuntimeError(err.decode("utf-8", "ignore")[:300])
+    return [l.strip() for l in out.decode("utf-8", "ignore").splitlines() if l.strip()]
+
+
+def cancel(holder):
+    holder["cancel"] = True
+    try:
+        holder["p"].kill()
+    except Exception:
+        pass
 
 
 def grab_raw(sct, region):
@@ -119,7 +138,7 @@ def grab_raw(sct, region):
 
 
 def prep(img):
-    k = 3 if img.width < 450 else 2   # ภาพเล็กขยายมากขึ้นให้ OCR อ่านง่าย
+    k = 3 if img.width < 300 else 2   # ภาพเล็กขยายมากขึ้นให้ OCR อ่านง่าย
     img = img.resize((img.width * k, img.height * k), Image.LANCZOS)
     return ImageOps.autocontrast(img.convert("L"))
 
@@ -214,9 +233,10 @@ class App:
     def loop(self):
         prev = done = None
         stable = 0
+        ex = ThreadPoolExecutor(2)
         with mss.mss() as sct:
             while self.running:
-                time.sleep(0.1)
+                time.sleep(0.05)
                 if not self.cfg.get("q"):
                     continue
                 try:
@@ -228,8 +248,16 @@ class App:
                     if done is not None and sdiff(sg, done) < 4:
                         continue                        # ภาพเดิมที่อ่านไปแล้ว
                     done = sg
-                    lines = ocr_lines(prep(grab_raw(sct, self.cfg["q"])))
-                    raw = " ".join(lines)
+                    img = prep(grab_raw(sct, self.cfg["q"]))
+                    hold = {}
+                    f_fast = ex.submit(ocr_lines, img, "eng")            # เร็ว: เหมาะกับโจทย์เลข
+                    f_full = ex.submit(ocr_lines, img, "tha+eng", hold)   # เต็ม: โจทย์ข้อความภาษาไทย
+                    raw_fast = " ".join(f_fast.result())
+                    if solve_math(raw_fast):
+                        cancel(hold)                                      # เป็นโจทย์เลขแล้ว ไม่ต้องรออ่านไทย
+                        raw = raw_fast
+                    else:
+                        raw = " ".join(f_full.result())
 
                     # 1) โจทย์เลขล้วน -> คำนวณเอง
                     m = solve_math(raw)
