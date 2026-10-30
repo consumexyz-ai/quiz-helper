@@ -1,6 +1,7 @@
 import sys, os, json, re, time, threading, ctypes, subprocess, io
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
+from decimal import Decimal
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)  # ให้พิกัดตรงกับจอจริง
@@ -16,45 +17,100 @@ QA_FILE = os.path.join(BASE, "qa.json")
 CFG_FILE = os.path.join(BASE, "config.json")
 TESS_DIR = os.path.join(BASE, "tesseract")
 TESS_EXE = os.path.join(TESS_DIR, "tesseract.exe")
-TRANSPARENT = "#010101"
 
 
 def norm(s):
     return re.sub(r"[\s\W_]+", "", s).lower()
 
 
+# ------------------------------------------------------------------ เครื่องคิดเลข
+
+_THAI = re.compile(r"[\u0e00-\u0e7f]")
+_THDIG = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+_FIX = str.maketrans({"O": "0", "o": "0", "l": "1", "I": "1", "|": "1", "S": "5", "B": "8"})
+_NUM = r"\d+(?:\.\d+)?"
+_ATOM = rf"{_NUM}(?:\s*/\s*\d+)?"            # ตัวเลข หรือเศษส่วน a/b
+_EXPR = re.compile(rf"{_ATOM}(?:\s*[-+*÷]\s*{_ATOM})+")
+_TOK = re.compile(rf"{_ATOM}|[-+*÷]")
+
+
+def _fmt(d):
+    return format(d.quantize(Decimal("0.000001")).normalize(), "f")
+
+
+def _unsure_operator(t):
+    nums = re.findall(r"\d+(?:\.\d+)?", t)
+    rest = re.sub(r"[\s=＝?？.,:;!]", "", t)
+    if len(nums) != 2 or len("".join(nums)) < 0.6 * len(rest):
+        return None
+    a, b = Decimal(nums[0]), Decimal(nums[1])
+    ans = f"ไม่แน่ใจเครื่องหมาย\n+ → {_fmt(a + b)}\n− → {_fmt(a - b)}"
+    return f"{nums[0]} ? {nums[1]}", ans, None
+
+
+def solve_math(text):
+    """โจทย์เลขล้วน เช่น '15 + 27 =?' หรือ '3/4 + 1/6 =?'
+    คืน (นิพจน์สำหรับแสดง, คำตอบ, นิพจน์มาตรฐาน) หรือ None ถ้าไม่ใช่โจทย์เลขล้วน"""
+    t = text.translate(_THDIG)
+    if _THAI.search(t):
+        return None
+    t = re.sub(r"[×✕✖xX]", "*", t)
+    t = re.sub(r"[−–—‒]", "-", t)
+    t = t.translate(_FIX)
+    t = re.sub(r"(?<=\d),(?=\d)", ".", t)
+    found = _EXPR.findall(t)
+    if not found:
+        return _unsure_operator(t)
+    best = max(found, key=len)
+    rest = re.sub(r"[\s=＝?？.,:;!]", "", t)
+    if len(re.sub(r"\s", "", best)) < 0.6 * len(rest):
+        return None                      # มีข้อความอื่นปนเยอะ ไม่ใช่โจทย์เลขล้วน
+    toks = [re.sub(r"\s+", "", x) for x in _TOK.findall(best)]
+    has_frac = any("/" in x for x in toks)
+
+    def val(x):
+        if "/" in x:
+            a, b = x.split("/")
+            return Fraction(int(a), int(b)) if int(b) else None
+        return Fraction(x)
+
+    nums = [val(x) for x in toks[0::2]]
+    if any(n is None for n in nums):
+        return None
+    ops = toks[1::2]
+    vals, vop = [nums[0]], []
+    for op, n in zip(ops, nums[1:]):
+        if op in "*÷":
+            if op == "÷" and n == 0:
+                return None
+            vals[-1] = vals[-1] * n if op == "*" else vals[-1] / n
+        else:
+            vop.append(op)
+            vals.append(n)
+    r = vals[0]
+    for op, n in zip(vop, vals[1:]):
+        r = r + n if op == "+" else r - n
+
+    if has_frac:
+        ans = str(r.numerator) if r.denominator == 1 else f"{r.numerator}/{r.denominator}"
+    else:
+        ans = _fmt(Decimal(r.numerator) / Decimal(r.denominator))
+    pretty = " ".join(toks).replace("*", "×")
+    return pretty, ans, "".join(toks)
+
+
 # ------------------------------------------------------------------ OCR
-def _tess(img, extra=()):
+def ocr_lines(img):
     if not os.path.exists(TESS_EXE):
         raise RuntimeError(f"ไม่พบ {TESS_EXE} (โฟลเดอร์ tesseract ต้องอยู่ข้างไฟล์ exe)")
     buf = io.BytesIO()
     img.save(buf, "PNG")
     env = dict(os.environ, TESSDATA_PREFIX=os.path.join(TESS_DIR, "tessdata"), OMP_THREAD_LIMIT="1")
-    p = subprocess.run([TESS_EXE, "stdin", "stdout", "-l", "tha+eng", "--psm", "6", *extra],
+    p = subprocess.run([TESS_EXE, "stdin", "stdout", "-l", "tha+eng", "--psm", "6"],
                        input=buf.getvalue(), capture_output=True, env=env, creationflags=0x08000000)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.decode("utf-8", "ignore")[:300])
-    return p.stdout.decode("utf-8", "ignore")
-
-
-def ocr_lines(img):
-    return [l.strip() for l in _tess(img).splitlines() if l.strip()]
-
-
-def ocr_options(img, n=4):
-    """OCR แบบมีพิกัด แล้วแบ่งภาพเป็น n แถบแนวตั้ง คืนข้อความของแต่ละแถบ"""
-    bands = [[] for _ in range(n)]
-    for row in _tess(img, ("tsv",)).splitlines()[1:]:
-        c = row.split("\t")
-        if len(c) < 12 or c[0] != "5":
-            continue
-        text = c[11].strip()
-        if not text or float(c[10]) < 0:
-            continue
-        cy = int(c[7]) + int(c[9]) / 2
-        b = min(n - 1, max(0, int(cy / img.height * n)))
-        bands[b].append((int(c[6]), text))
-    return ["".join(t for _, t in sorted(b)) for b in bands]
+    return [l.strip() for l in p.stdout.decode("utf-8", "ignore").splitlines() if l.strip()]
 
 
 def grab_raw(sct, region):
@@ -76,7 +132,6 @@ def sdiff(a, b):
     return sum(abs(p - q) for p, q in zip(a, b)) / len(a)
 
 
-# ------------------------------------------------------------------ UI helpers
 def pick_region(root, title):
     sel, st = {}, {}
     top = tk.Toplevel(root)
@@ -109,46 +164,6 @@ def pick_region(root, title):
     return sel or None
 
 
-class Highlight:
-    """หน้าต่างโปร่งใสวางทับช่องตัวเลือก วาดกรอบรอบข้อที่ถูก คลิกทะลุได้ ไม่แย่งโฟกัสเกม"""
-
-    def __init__(self, root):
-        self.win = tk.Toplevel(root)
-        w = self.win
-        w.overrideredirect(True)
-        w.attributes("-topmost", True)
-        w.attributes("-transparentcolor", TRANSPARENT)
-        w.configure(bg=TRANSPARENT)
-        self.cv = tk.Canvas(w, bg=TRANSPARENT, highlightthickness=0)
-        self.cv.pack(fill="both", expand=True)
-        self.region = None
-
-    def place(self, region):
-        self.region = region
-        self.win.geometry(f"{region['width']}x{region['height']}+{region['left']}+{region['top']}")
-        self.win.update_idletasks()
-        try:
-            u = ctypes.windll.user32
-            hwnd = u.GetParent(self.win.winfo_id()) or self.win.winfo_id()
-            ex = u.GetWindowLongW(hwnd, -20)
-            # LAYERED | TRANSPARENT (คลิกทะลุ) | TOOLWINDOW | NOACTIVATE
-            u.SetWindowLongW(hwnd, -20, ex | 0x80000 | 0x20 | 0x80 | 0x08000000)
-        except Exception:
-            pass
-
-    def clear(self):
-        self.cv.delete("all")
-
-    def show(self, items, n=4):
-        self.cv.delete("all")
-        if not self.region:
-            return
-        w, h = self.region["width"], self.region["height"]
-        for band, color in items:
-            y1, y2 = band * h / n + 2, (band + 1) * h / n - 2
-            self.cv.create_rectangle(3, y1, w - 3, y2, outline=color, width=4)
-
-
 # ------------------------------------------------------------------ app
 class App:
     def __init__(self):
@@ -157,7 +172,7 @@ class App:
         r.attributes("-topmost", True)
         r.geometry("380x190+40+40")
         r.configure(bg="#1b1b1b")
-        self.ans = tk.Label(r, text="", font=("Tahoma", 15, "bold"), bg="#1b1b1b",
+        self.ans = tk.Label(r, text="", font=("Tahoma", 16, "bold"), bg="#1b1b1b",
                             fg="#7CFC00", wraplength=360, justify="left")
         self.ans.pack(fill="both", expand=True, padx=8, pady=(8, 0))
         self.info = tk.Label(r, text="", font=("Tahoma", 9), bg="#1b1b1b", fg="#aaa",
@@ -168,10 +183,13 @@ class App:
         self.qa = json.load(open(QA_FILE, encoding="utf-8"))
         self.keys = list(self.qa)
         self.nq = [norm(k) for k in self.keys]
+        # โจทย์เลขในฐานข้อมูล ไว้ตรวจเทียบกับผลที่คำนวณได้
+        self.mathdb = {}
+        for k, v in self.qa.items():
+            m = solve_math(k)
+            if m and m[2]:
+                self.mathdb[m[2]] = v.strip()
         self.cfg = json.load(open(CFG_FILE)) if os.path.exists(CFG_FILE) else {}
-        self.hl = Highlight(r)
-        if self.cfg.get("o"):
-            self.hl.place(self.cfg["o"])
         self.ans.config(text="รอโจทย์..." if self.cfg.get("q") else "กด 'ตั้งพื้นที่' ก่อนครับ")
         self.info.config(text=f"ฐานข้อมูล {len(self.qa)} ข้อ")
         self.running = True
@@ -183,53 +201,49 @@ class App:
         self.running = False
         self.root.destroy()
 
-    def ui(self, fn):
-        self.root.after(0, fn)
-
     def setup(self):
         self.root.withdraw()
-        self.hl.clear()
         time.sleep(0.3)
-        q = pick_region(self.root, "1/2 ลากคลุม 'ช่องโจทย์'")
-        o = pick_region(self.root, "2/2 ลากคลุมตัวเลือก 4 ข้อ (ขอบบนปุ่มแรก ถึง ขอบล่างปุ่มสุดท้าย)") if q else None
+        q = pick_region(self.root, "ลากคลุม 'ช่องโจทย์' ให้พอดีกับข้อความ")
         self.root.deiconify()
-        if q and o:
-            self.cfg = {"q": q, "o": o}
+        if q:
+            self.cfg = {"q": q}
             json.dump(self.cfg, open(CFG_FILE, "w"))
-            self.hl.place(o)
             self.ans.config(text="รอโจทย์...")
 
     def loop(self):
-        ex = ThreadPoolExecutor(2)
         prev = done = None
-        stable = retries = 0
+        stable = 0
         with mss.mss() as sct:
             while self.running:
                 time.sleep(0.1)
-                q, o = self.cfg.get("q"), self.cfg.get("o")
-                if not q:
+                if not self.cfg.get("q"):
                     continue
                 try:
-                    sg = sig(grab_raw(sct, q))
-                    if prev is None or sdiff(sg, prev) >= 4:
-                        stable = 0
-                        if done is None or sdiff(sg, done) >= 4:
-                            self.ui(self.hl.clear)     # โจทย์เปลี่ยน: ลบกรอบเก่า
-                    else:
-                        stable += 1
+                    sg = sig(grab_raw(sct, self.cfg["q"]))
+                    stable = stable + 1 if prev is not None and sdiff(sg, prev) < 4 else 0
                     prev = sg
                     if stable < 2:                      # รอภาพนิ่งประมาณ 0.2 วินาที
                         continue
                     if done is not None and sdiff(sg, done) < 4:
                         continue                        # ภาพเดิมที่อ่านไปแล้ว
                     done = sg
-                    self.ui(self.hl.clear)
-                    time.sleep(0.05)
-                    qi = grab_raw(sct, q)
-                    fq = ex.submit(ocr_lines, prep(qi))
-                    fo = ex.submit(ocr_options, prep(grab_raw(sct, o))) if o else None
-                    qtxt = norm("".join(fq.result()))
-                    opts = fo.result() if fo else []
+                    lines = ocr_lines(prep(grab_raw(sct, self.cfg["q"])))
+                    raw = " ".join(lines)
+
+                    # 1) โจทย์เลขล้วน -> คำนวณเอง
+                    m = solve_math(raw)
+                    if m:
+                        pretty, ans, canon = m
+                        db = self.mathdb.get(canon)
+                        if db and db != ans:
+                            self.show(f"ไม่แน่ใจ: {ans} หรือ {db}", f"อ่านโจทย์ได้: {pretty} = ?  (คำนวณกับฐานข้อมูลไม่ตรงกัน)")
+                        else:
+                            self.show(ans, f"อ่านโจทย์ได้: {pretty} = ?" + ("  ✔ ตรงฐานข้อมูล" if db else ""))
+                        continue
+
+                    # 2) โจทย์ข้อความ -> หาในฐานข้อมูล
+                    qtxt = norm(raw)
                     if len(qtxt) < 6:
                         continue
                     ms = process.extract(qtxt, self.nq, scorer=fuzz.ratio, limit=2)
@@ -239,38 +253,14 @@ class App:
                     picks = [ms[0]]
                     if len(ms) > 1 and ms[0][1] - ms[1][1] < 4 and ms[1][1] >= 60:
                         picks.append(ms[1])
-                    answers = [self.qa[self.keys[m[2]]] for m in picks]
-
-                    items = []
-                    if any(opts):
-                        nopts = [norm(x) for x in opts]
-                        for k, m in enumerate(picks):
-                            na = norm(answers[k])
-                            scorer = fuzz.partial_ratio if len(na) >= 5 else fuzz.ratio
-                            sc = [scorer(na, x) if x else 0 for x in nopts]
-                            order = sorted(range(len(sc)), key=lambda i: -sc[i])
-                            if sc[order[0]] >= 60:
-                                items.append((order[0], "#00ff00" if k == 0 else "#ffd400"))
-                                if k == 0 and sc[order[0]] - sc[order[1]] < 8:
-                                    items.append((order[1], "#ffd400"))
-                    if o and not items and retries < 3:   # ตัวเลือกอาจยังไม่ขึ้น ลองอ่านซ้ำ
-                        retries += 1
-                        done = None
-                        time.sleep(0.4)
-                    else:
-                        retries = 0
-
-                    text = answers[0] if len(answers) == 1 else "ไม่แน่ใจ:\n" + "\n".join(answers)
-                    note = " / ".join(f"{self.keys[m[2]]} ({int(m[1])}%)" for m in picks)
-                    if o:
-                        note += "\nOCR ตัวเลือก: " + " | ".join(x[:14] for x in opts)
-                    self.show(text, note)
-                    self.ui(lambda it=items: self.hl.show(it))
+                    answers = [self.qa[self.keys[x[2]]] for x in picks]
+                    note = " / ".join(f"{self.keys[x[2]]} ({int(x[1])}%)" for x in picks)
+                    self.show(answers[0] if len(answers) == 1 else "ไม่แน่ใจ:\n" + "\n".join(answers), note)
                 except Exception as e:
                     self.show("OCR error", str(e)[:400])
 
     def show(self, a, i):
-        self.ui(lambda: (self.ans.config(text=a), self.info.config(text=i)))
+        self.root.after(0, lambda: (self.ans.config(text=a), self.info.config(text=i)))
 
 
 if __name__ == "__main__":
